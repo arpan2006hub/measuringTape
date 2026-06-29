@@ -1,0 +1,70 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and subscriptions",
+      "type": "object",
+      "properties": {
+        "username": { "type": "string" },
+        "passwordHash": { "type": "string" },
+        "role": { "type": "string" },
+        "reputationPoints": { "type": "number" },
+        "walletAddress": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["username", "passwordHash", "role", "reputationPoints", "walletAddress"]
+    },
+    "Issue": {
+      "title": "Issue",
+      "description": "Civic issue reported by citizens",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "category": { "type": "string" },
+        "locality": { "type": "string" },
+        "location": { "type": "object" },
+        "imageCid": { "type": "string" },
+        "reporterAddress": { "type": "string" },
+        "status": { "type": "string" },
+        "metadataCid": { "type": "string" },
+        "supportCount": { "type": "number" },
+        "reputationPoints": { "type": "number" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "title", "reporterAddress", "status"]
+    },
+    "Vote": {
+      "title": "Vote",
+      "description": "Verification or resolution vote",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "issueId": { "type": "string" },
+        "voterAddress": { "type": "string" },
+        "type": { "type": "string" },
+        "choice": { "type": "string" },
+        "reputationWeight": { "type": "number" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "issueId", "voterAddress", "type", "choice"]
+    }
+  },
+  "firestore": {
+    "/users/{username}": {
+      "schema": "User",
+      "description": "Users indexed by username"
+    },
+    "/issues/{issueId}": {
+      "schema": "Issue",
+      "description": "Issues registered"
+    },
+    "/votes/{voteId}": {
+      "schema": "Vote",
+      "description": "Votes registered"
+    }
+  }
+}

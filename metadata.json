@@ -1,0 +1,6 @@
+{
+  "name": "measuringTape",
+  "description": "A decentralized civic issue reporting platform that enables citizens to report public infrastructure issues while ensuring transparency through blockchain.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

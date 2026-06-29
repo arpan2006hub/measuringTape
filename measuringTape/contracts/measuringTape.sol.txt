@@ -1,0 +1,351 @@
+//# measuringTape Smart Contracts
+
+//This directory contains the Solidity smart contracts for the **measuringTape** platform.
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @title measuringTape
+/// @notice Minimal audit contract for the measuringTape civic issue reporting platform.
+/// @dev
+/// Design goals from docs/system-design.md:
+/// - Store only immutable audit references and compact counters on-chain.
+/// - Do not store images, descriptions, GPS coordinates, category labels, or full metadata JSON.
+/// - Keep IPFS as the source for large metadata through CIDs.
+/// - Keep deployment simple enough for Remix on Ethereum Sepolia.
+///
+/// Operational model:
+/// - The platform backend/custodial wallet is the owner by default.
+/// - The owner can authorize operator wallets for backend services.
+/// - User-facing actions accept an `actor` address so the backend can submit
+///   transactions without requiring citizens to use MetaMask directly.
+contract measuringTape {
+    /// @notice Canonical issue lifecycle.
+    enum IssueStatus {
+        REPORTED,
+        VERIFIED,
+        ASSIGNED,
+        IN_PROGRESS,
+        RESOLVED,
+        CLOSED
+    }
+
+    /// @notice Compact on-chain record for an issue.
+    /// @dev
+    /// Large fields such as title, description, images, category, locality, and
+    /// GPS coordinates must live in IPFS metadata referenced by `metadataCID`
+    /// and, after authority resolution, `resolutionCID`.
+    struct Issue {
+        string metadataCID;
+        string resolutionCID;
+        IssueStatus status;
+        uint256 supportCount;
+    }
+
+    address public owner;
+    uint256 public nextIssueId;
+
+    /// @notice Issue ID to compact issue record.
+    mapping(uint256 => Issue) private issues;
+
+    /// @notice User or authority reputation score.
+    /// @dev Signed integer allows penalties without underflow.
+    mapping(address => int256) public reputation;
+
+    /// @notice Backend/operator wallets allowed to write audit actions.
+    mapping(address => bool) public operators;
+
+    event IssueCreated(
+        uint256 indexed issueId,
+        string metadataCID,
+        IssueStatus status,
+        uint256 createdAt
+    );
+
+    event IssueSupported(
+        uint256 indexed issueId,
+        address indexed supporter,
+        uint256 supportCount
+    );
+
+    event IssueVerified(
+        uint256 indexed issueId,
+        address indexed verifier,
+        bool accepted,
+        IssueStatus status
+    );
+
+    event StatusUpdated(
+        uint256 indexed issueId,
+        IssueStatus previousStatus,
+        IssueStatus newStatus
+    );
+
+    event ResolutionAttached(
+        uint256 indexed issueId,
+        string resolutionCID,
+        IssueStatus status
+    );
+
+    event IssueClosed(
+        uint256 indexed issueId,
+        address indexed verifier,
+        string resolutionCID
+    );
+
+    event ReputationUpdated(
+        address indexed actor,
+        int256 previousReputation,
+        int256 newReputation
+    );
+
+    event OperatorUpdated(address indexed operator, bool allowed);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
+    }
+
+    modifier onlyOperator() {
+        require(msg.sender == owner || operators[msg.sender], "Only operator");
+        _;
+    }
+
+    modifier validActor(address actor) {
+        require(actor != address(0), "Invalid actor");
+        _;
+    }
+
+    modifier issueExists(uint256 issueId) {
+        require(bytes(issues[issueId].metadataCID).length > 0, "Issue not found");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+        operators[msg.sender] = true;
+        emit OperatorUpdated(msg.sender, true);
+    }
+
+    /// @notice Transfers contract ownership to a new backend/custodial wallet.
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Invalid owner");
+
+        address previousOwner = owner;
+        owner = newOwner;
+        operators[newOwner] = true;
+
+        emit OwnershipTransferred(previousOwner, newOwner);
+        emit OperatorUpdated(newOwner, true);
+    }
+
+    /// @notice Allows or removes an operator wallet.
+    /// @dev Operators are intended for backend services, not public governance.
+    function setOperator(address operator, bool allowed) external onlyOwner {
+        require(operator != address(0), "Invalid operator");
+
+        operators[operator] = allowed;
+        emit OperatorUpdated(operator, allowed);
+    }
+
+    /// @notice Creates a new issue audit record with an IPFS metadata CID.
+    /// @dev
+    /// The metadata JSON should contain large fields off-chain, including:
+    /// title, description, category, locality, latitude, longitude, and imageCID.
+    function createIssue(string calldata metadataCID)
+        external
+        onlyOperator
+        returns (uint256 issueId)
+    {
+        require(bytes(metadataCID).length > 0, "metadataCID required");
+
+        issueId = nextIssueId;
+        nextIssueId += 1;
+
+        issues[issueId] = Issue({
+            metadataCID: metadataCID,
+            resolutionCID: "",
+            status: IssueStatus.REPORTED,
+            supportCount: 0
+        });
+
+        emit IssueCreated(issueId, metadataCID, IssueStatus.REPORTED, block.timestamp);
+    }
+
+    /// @notice Adds one support to an existing issue.
+    /// @dev The backend passes the actual supporter identity as `supporter`.
+    function supportIssue(uint256 issueId, address supporter)
+        external
+        onlyOperator
+        validActor(supporter)
+        issueExists(issueId)
+    {
+        Issue storage issue = issues[issueId];
+        require(issue.status != IssueStatus.CLOSED, "Issue closed");
+
+        issue.supportCount += 1;
+
+        _updateReputation(supporter, 1);
+
+        emit IssueSupported(issueId, supporter, issue.supportCount);
+    }
+
+    /// @notice Records issue verification and updates status/reputation.
+    /// @dev
+    /// Consensus can be calculated off-chain by the backend. This function stores
+    /// the compact outcome only. If `accepted` is true, the issue moves to VERIFIED.
+    function verifyIssue(uint256 issueId, address verifier, bool accepted)
+        external
+        onlyOperator
+        validActor(verifier)
+        issueExists(issueId)
+    {
+        Issue storage issue = issues[issueId];
+        require(issue.status == IssueStatus.REPORTED, "Issue not reportable");
+
+        if (accepted) {
+            _setStatus(issueId, IssueStatus.VERIFIED);
+            _updateReputation(verifier, 5);
+        } else {
+            _updateReputation(verifier, -3);
+        }
+
+        emit IssueVerified(issueId, verifier, accepted, issue.status);
+    }
+
+    /// @notice Updates an issue status according to the lifecycle.
+    /// @dev Intended for backend/authority actions after off-chain authorization.
+    function updateStatus(uint256 issueId, IssueStatus newStatus)
+        external
+        onlyOperator
+        issueExists(issueId)
+    {
+        _setStatus(issueId, newStatus);
+    }
+
+    /// @notice Attaches an IPFS resolution CID and marks the issue RESOLVED.
+    /// @dev The resolution CID should point to IPFS metadata for resolution proof.
+    function attachResolution(uint256 issueId, string calldata resolutionCID)
+        external
+        onlyOperator
+        issueExists(issueId)
+    {
+        require(bytes(resolutionCID).length > 0, "resolutionCID required");
+
+        Issue storage issue = issues[issueId];
+        require(issue.status == IssueStatus.IN_PROGRESS, "Issue not in progress");
+
+        issue.resolutionCID = resolutionCID;
+        _setStatus(issueId, IssueStatus.RESOLVED);
+
+        emit ResolutionAttached(issueId, resolutionCID, IssueStatus.RESOLVED);
+    }
+
+    /// @notice Records resolution verification and either closes or reopens work.
+    /// @dev
+    /// If `resolved` is true, the issue becomes CLOSED.
+    /// If false, the issue returns to IN_PROGRESS for further authority work.
+    function verifyResolution(uint256 issueId, address verifier, bool resolved)
+        external
+        onlyOperator
+        validActor(verifier)
+        issueExists(issueId)
+    {
+        Issue storage issue = issues[issueId];
+        require(issue.status == IssueStatus.RESOLVED, "Issue not resolved");
+        require(bytes(issue.resolutionCID).length > 0, "No resolution CID");
+
+        if (resolved) {
+            _setStatus(issueId, IssueStatus.CLOSED);
+            _updateReputation(verifier, 10);
+            emit IssueClosed(issueId, verifier, issue.resolutionCID);
+        } else {
+            _setStatus(issueId, IssueStatus.IN_PROGRESS);
+            _updateReputation(verifier, -5);
+        }
+    }
+
+    /// @notice Directly updates reputation for backend-calculated outcomes.
+    /// @dev Useful when consensus and correctness are calculated off-chain.
+    function updateReputation(address actor, int256 delta)
+        external
+        onlyOperator
+        validActor(actor)
+    {
+        _updateReputation(actor, delta);
+    }
+
+    /// @notice Returns compact issue data for UI/API reads.
+    function getIssue(uint256 issueId)
+        external
+        view
+        issueExists(issueId)
+        returns (
+            string memory metadataCID,
+            string memory resolutionCID,
+            IssueStatus status,
+            uint256 supportCount
+        )
+    {
+        Issue storage issue = issues[issueId];
+
+        return (
+            issue.metadataCID,
+            issue.resolutionCID,
+            issue.status,
+            issue.supportCount
+        );
+    }
+
+    /// @notice Checks whether a status transition follows the issue lifecycle.
+    function canTransition(IssueStatus fromStatus, IssueStatus toStatus)
+        public
+        pure
+        returns (bool)
+    {
+        if (fromStatus == IssueStatus.REPORTED) {
+            return toStatus == IssueStatus.VERIFIED;
+        }
+
+        if (fromStatus == IssueStatus.VERIFIED) {
+            return toStatus == IssueStatus.ASSIGNED;
+        }
+
+        if (fromStatus == IssueStatus.ASSIGNED) {
+            return toStatus == IssueStatus.IN_PROGRESS;
+        }
+
+        if (fromStatus == IssueStatus.IN_PROGRESS) {
+            return toStatus == IssueStatus.RESOLVED;
+        }
+
+        if (fromStatus == IssueStatus.RESOLVED) {
+            return toStatus == IssueStatus.CLOSED || toStatus == IssueStatus.IN_PROGRESS;
+        }
+
+        return false;
+    }
+
+    function _setStatus(uint256 issueId, IssueStatus newStatus) private {
+        Issue storage issue = issues[issueId];
+        IssueStatus previousStatus = issue.status;
+
+        require(previousStatus != newStatus, "Status unchanged");
+        require(canTransition(previousStatus, newStatus), "Invalid status transition");
+
+        issue.status = newStatus;
+
+        emit StatusUpdated(issueId, previousStatus, newStatus);
+    }
+
+    function _updateReputation(address actor, int256 delta) private {
+        int256 previousReputation = reputation[actor];
+        int256 newReputation = previousReputation + delta;
+
+        reputation[actor] = newReputation;
+
+        emit ReputationUpdated(actor, previousReputation, newReputation);
+    }
+}
